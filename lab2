@@ -3,13 +3,24 @@
 #include <random>
 #include <chrono>
 #include <cmath>
-#include <arm_neon.h> // ARM NEON头文件
+#include <arm_neon.h>
+#include <stdlib.h> 
 
 using namespace std;
 using namespace std::chrono;
 
-// 生成对角占优矩阵
-void  matrix(vector<vector<float>>& A, int n) {
+// 对齐内存分配函数
+template<typename T>
+T* aligned_alloc(size_t alignment, size_t size) {
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size * sizeof(T)) != 0) {
+        throw bad_alloc();
+    }
+    return static_cast<T*>(ptr);
+}
+
+// 生成对角占优矩阵（使用对齐内存）
+void generate_matrix(float** A, int n) {
     random_device rd;
     mt19937 gen(rd());
     uniform_real_distribution<float> dis(1.0, 10.0);
@@ -27,7 +38,7 @@ void  matrix(vector<vector<float>>& A, int n) {
 }
 
 // 串行高斯消去
-void  chuanxing(vector<vector<float>>& A, int n) {
+void chuanxing(float** A, int n) {
     for (int k = 0; k < n; k++) {
         // 主元归一化
         for (int j = k + 1; j < n; j++) {
@@ -46,8 +57,70 @@ void  chuanxing(vector<vector<float>>& A, int n) {
     }
 }
 
-// NEON并行化高斯消去
-void neon(vector<vector<float>>& A, int n) {
+// 对齐内存的NEON并行化高斯消去
+void neon_aligned(float** A, int n) {
+    for (int k = 0; k < n; k++) {
+        // 加载主元
+        float pivot = A[k][k];
+        float32x4_t pivot_vec = vdupq_n_f32(1.0f / pivot);
+
+        // 向量化归一化 - 处理非对齐部分
+        int j = k + 1;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(&A[k][j]);
+        int misalignment = (16 - (addr % 16)) / sizeof(float);
+        if (misalignment != 4) {  // 只有当不对齐时才需要处理
+            for (; j < k + 1 + misalignment && j < n; j++) {
+                A[k][j] /= pivot;
+            }
+        }
+
+        // 向量化归一化 - 处理对齐部分
+        for (; j + 4 <= n; j += 4) {
+            // 使用对齐加载指令
+            float32x4_t row = vld1q_f32(&A[k][j]);
+            row = vmulq_f32(row, pivot_vec);
+            vst1q_f32(&A[k][j], row);
+        }
+
+        // 处理剩余元素
+        for (; j < n; j++) {
+            A[k][j] /= pivot;
+        }
+        A[k][k] = 1.0f;
+
+        // 向量化消去
+        for (int i = k + 1; i < n; i++) {
+            float32x4_t factor_vec = vdupq_n_f32(A[i][k]);
+
+            // 处理非对齐部分
+            j = k + 1;
+            addr = reinterpret_cast<uintptr_t>(&A[i][j]);
+            misalignment = (16 - (addr % 16)) / sizeof(float);
+            if (misalignment != 4) {
+                for (; j < k + 1 + misalignment && j < n; j++) {
+                    A[i][j] -= A[i][k] * A[k][j];
+                }
+            }
+
+            // 处理对齐部分
+            for (; j + 4 <= n; j += 4) {
+                float32x4_t a_kj = vld1q_f32(&A[k][j]);
+                float32x4_t a_ij = vld1q_f32(&A[i][j]);
+                a_ij = vmlsq_f32(a_ij, factor_vec, a_kj); // a_ij -= factor * a_kj
+                vst1q_f32(&A[i][j], a_ij);
+            }
+
+            // 处理剩余元素
+            for (; j < n; j++) {
+                A[i][j] -= A[i][k] * A[k][j];
+            }
+            A[i][k] = 0.0f;
+        }
+    }
+}
+
+// 非对齐内存的NEON并行化高斯消去（用于对比）
+void neon_unaligned(float** A, int n) {
     for (int k = 0; k < n; k++) {
         // 加载主元
         float pivot = A[k][k];
@@ -61,7 +134,9 @@ void neon(vector<vector<float>>& A, int n) {
             vst1q_f32(&A[k][j], row);
         }
         // 处理剩余元素
-        for (; j < n; j++) A[k][j] /= pivot;
+        for (; j < n; j++) {
+            A[k][j] /= pivot;
+        }
         A[k][k] = 1.0f;
 
         // 向量化消去
@@ -71,18 +146,20 @@ void neon(vector<vector<float>>& A, int n) {
             for (; j + 4 <= n; j += 4) {
                 float32x4_t a_kj = vld1q_f32(&A[k][j]);
                 float32x4_t a_ij = vld1q_f32(&A[i][j]);
-                a_ij = vmlsq_f32(a_ij, factor_vec, a_kj); // a_ij -= factor * a_kj
+                a_ij = vmlsq_f32(a_ij, factor_vec, a_kj);
                 vst1q_f32(&A[i][j], a_ij);
             }
             // 处理剩余元素
-            for (; j < n; j++) A[i][j] -= A[i][k] * A[k][j];
+            for (; j < n; j++) {
+                A[i][j] -= A[i][k] * A[k][j];
+            }
             A[i][k] = 0.0f;
         }
     }
 }
 
 // 验证结果一致性
-bool verify(const vector<vector<float>>& A, const vector<vector<float>>& B, int n, float epsilon = 1e-4f) {
+bool verify(float** A, float** B, int n, float epsilon = 1e-4f) {
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             if (fabs(A[i][j] - B[i][j]) > epsilon) {
@@ -95,42 +172,86 @@ bool verify(const vector<vector<float>>& A, const vector<vector<float>>& B, int 
     return true;
 }
 
+// 复制矩阵
+void copy_matrix(float** src, float** dst, int n) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            dst[i][j] = src[i][j];
+        }
+    }
+}
+
 int main() {
-    const int sizes[] = { 128, 256, 512 }; // 测试不同规模
+    const int sizes[] = { 128, 256, 512, 1024 }; // 测试不同规模
     const int num_tests = sizeof(sizes) / sizeof(sizes[0]);
 
     for (int t = 0; t < num_tests; t++) {
         int n = sizes[t];
-        vector<vector<float>> A_chuanxing(n, vector<float>(n));
-        vector<vector<float>> A_neon(n, vector<float>(n));
+
+        // 分配对齐内存
+        float** A_chuanxing = new float* [n];
+        float** A_neon_aligned = new float* [n];
+        float** A_neon_unaligned = new float* [n];
+
+        for (int i = 0; i < n; i++) {
+            A_chuanxing[i] = aligned_alloc<float>(16, n);
+            A_neon_aligned[i] = aligned_alloc<float>(16, n);
+            A_neon_unaligned[i] = new float[n]; // 非对齐分配
+        }
 
         // 生成相同矩阵
-        matrix(A_chuanxing, n);
-        A_neon = A_chuanxing;
+        generate_matrix(A_chuanxing, n);
+        copy_matrix(A_chuanxing, A_neon_aligned, n);
+        copy_matrix(A_chuanxing, A_neon_unaligned, n);
 
         // 串行版本测试
         auto start = high_resolution_clock::now();
         chuanxing(A_chuanxing, n);
         auto end = high_resolution_clock::now();
-        auto serial_time = duration_cast<microseconds>(end - start).count();
+        auto chuanxing_time = duration_cast<microseconds>(end - start).count();
 
-        // NEON版本测试
+        // NEON对齐版本测试
         start = high_resolution_clock::now();
-        neon(A_neon, n);
+        neon_aligned(A_neon_aligned, n);
         end = high_resolution_clock::now();
-        auto neon_time = duration_cast<microseconds>(end - start).count();
+        auto neon_aligned_time = duration_cast<microseconds>(end - start).count();
+
+        // NEON非对齐版本测试
+        start = high_resolution_clock::now();
+        neon_unaligned(A_neon_unaligned, n);
+        end = high_resolution_clock::now();
+        auto neon_unaligned_time = duration_cast<microseconds>(end - start).count();
 
         // 验证结果
-        if (!verify(A_chuanxing, A_neon, n)) {
-            cerr << "结果验证失败！" << endl;
+        if (!verify(A_chuanxing, A_neon_aligned, n)) {
+            cerr << "对齐NEON版本结果验证失败！" << endl;
+            return 1;
+        }
+        if (!verify(A_chuanxing, A_neon_unaligned, n)) {
+            cerr << "非对齐NEON版本结果验证失败！" << endl;
             return 1;
         }
 
         // 输出结果
-        cout << "Matrix " << n << "x" << n << ":\t"
-            << "chuanxing: " << serial_time / 1000.0 << " ms\t"
-            << "NEON: " << neon_time / 1000.0 << " ms\t"
-            << "Speedup: " << (float)serial_time / neon_time << "x" << endl;
+        cout << "Matrix " << n << "x" << n << ":\n"
+            << "  Chuanxing:      " << chuanxing_time / 1000.0 << " ms\n"
+            << "  NEON Aligned: " << neon_aligned_time / 1000.0 << " ms (Speedup: "
+            << (float)chuanxing_time / neon_aligned_time << "x)\n"
+            << "  NEON Unaligned: " << neon_unaligned_time / 1000.0 << " ms (Speedup: "
+            << (float)chuanxing_time / neon_unaligned_time << "x)\n"
+            << "  Aligned vs Unaligned: "
+            << (float)neon_unaligned_time / neon_aligned_time << "x faster\n"
+            << endl;
+
+        // 释放内存
+        for (int i = 0; i < n; i++) {
+            free(A_chuanxing[i]);
+            free(A_neon_aligned[i]);
+            delete[] A_neon_unaligned[i];
+        }
+        delete[] A_chuanxing;
+        delete[] A_neon_aligned;
+        delete[] A_neon_unaligned;
     }
     return 0;
 }
