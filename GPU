@@ -1,0 +1,245 @@
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <iomanip>
+#include <cstdlib>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+using namespace std;
+
+// 错误检查宏
+#define CHECK_CUDA_ERROR(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " \
+             << cudaGetErrorString(err) << endl; \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// 初始化矩阵
+void initialize(float* matrix, int N) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            matrix[i * N + j] = static_cast<float>(rand()) / RAND_MAX * 10.0f;
+        }
+    }
+}
+
+// CPU平凡高斯消元
+void cpuGaussian(float* matrix, int N) {
+    for (int k = 0; k < N; k++) {
+        // 除法部分
+        float pivot = matrix[k * N + k];
+        for (int j = k + 1; j < N; j++) {
+            matrix[k * N + j] /= pivot;
+        }
+        matrix[k * N + k] = 1.0f;
+
+        // 消去部分
+        for (int i = k + 1; i < N; i++) {
+            float factor = matrix[i * N + k];
+            for (int j = k + 1; j < N; j++) {
+                matrix[i * N + j] -= factor * matrix[k * N + j];
+            }
+            matrix[i * N + k] = 0.0f;
+        }
+    }
+}
+
+// 核函数1: 除法部分
+__global__ void division(float* matrix, int k, int N) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col > k && col < N) {
+        matrix[k * N + col] /= matrix[k * N + k];
+    }
+    if (col == k && col < N) {
+        matrix[k * N + k] = 1.0f;
+    }
+}
+
+// 核函数2: 消去部分 - 每个线程处理一行中的多个元素
+__global__ void elimination_V1(float* matrix, int k, int N) {
+    int row = blockIdx.x + k + 1;
+    if (row < N) {
+        float factor = matrix[row * N + k];
+        for (int col = k + 1; col < N; col++) {
+            matrix[row * N + col] -= factor * matrix[k * N + col];
+        }
+        matrix[row * N + k] = 0.0f;
+    }
+}
+
+// 核函数2的替代版本: 每个线程处理一个元素
+__global__ void elimination_V2(float* matrix, int k, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = k + 1 + idx / (N - k - 1);
+    int col = k + 1 + idx % (N - k - 1);
+    
+    if (row < N && col < N) {
+        float factor = matrix[row * N + k];
+        matrix[row * N + col] -= factor * matrix[k * N + col];
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            matrix[row * N + k] = 0.0f;
+        }
+    }
+}
+
+// 核函数2的另一种版本: 使用共享内存
+__global__ void elimination_V3(float* matrix, int k, int N) {
+    extern __shared__ float sharedRow[];
+    int row = blockIdx.x + k + 1;
+    int tid = threadIdx.x;
+    
+    if (row < N) {
+        // 将当前行加载到共享内存
+        for (int i = tid + k + 1; i < N; i += blockDim.x) {
+            sharedRow[i - (k + 1)] = matrix[row * N + i];
+        }
+        
+        // 将消去因子加载到寄存器
+        float factor = matrix[row * N + k];
+        
+        __syncthreads();
+        
+        // 执行消去操作
+        for (int i = tid + k + 1; i < N; i += blockDim.x) {
+            sharedRow[i - (k + 1)] -= factor * matrix[k * N + i];
+        }
+        
+        __syncthreads();
+        
+        // 将结果写回全局内存
+        for (int i = tid + k + 1; i < N; i += blockDim.x) {
+            matrix[row * N + i] = sharedRow[i - (k + 1)];
+        }
+        
+        if (tid == 0) {
+            matrix[row * N + k] = 0.0f;
+        }
+    }
+}
+
+// GPU高斯消元主函数
+void gpuGaussian(float* matrix, int N, int blockSize, int version) {
+    float* d_matrix;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_matrix, N * N * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_matrix, matrix, N * N * sizeof(float), cudaMemcpyHostToDevice));
+    
+    cudaEvent_t start, stop;
+    CHECK_CUDA_ERROR(cudaEventCreate(&start));
+    CHECK_CUDA_ERROR(cudaEventCreate(&stop));
+    CHECK_CUDA_ERROR(cudaEventRecord(start, 0));
+    
+    for (int k = 0; k < N; k++) {
+        // 除法部分
+        int numBlocksDiv = (N - k + blockSize - 1) / blockSize;
+        division<<<numBlocksDiv, blockSize>>>(d_matrix, k, N);
+        CHECK_CUDA_ERROR(cudaGetLastError());
+        
+        // 消去部分
+        int remainingRows = N - k - 1;
+        if (remainingRows <= 0) continue;
+        
+        switch (version) {
+            case 1: {
+                // 版本1: 每个线程块处理一行
+                elimination_V1<<<remainingRows, 1>>>(d_matrix, k, N);
+                break;
+            }
+            case 2: {
+                // 版本2: 每个线程处理一个元素
+                int numElements = remainingRows * (N - k - 1);
+                int numBlocksElim = (numElements + blockSize - 1) / blockSize;
+                elimination_V2<<<numBlocksElim, blockSize>>>(d_matrix, k, N);
+                break;
+            }
+            case 3: {
+                // 版本3: 使用共享内存
+                elimination_V3<<<remainingRows, blockSize, (N - k - 1) * sizeof(float)>>>(d_matrix, k, N);
+                break;
+            }
+            default:
+                cerr << "Invalid kernel version" << endl;
+                exit(EXIT_FAILURE);
+        }
+        CHECK_CUDA_ERROR(cudaGetLastError());
+    }
+    
+    CHECK_CUDA_ERROR(cudaEventRecord(stop, 0));
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    
+    float milliseconds = 0;
+    CHECK_CUDA_ERROR(cudaEventElapsedTime(&milliseconds, start, stop));
+    cout << "GPU time: " << milliseconds << " ms" << endl;
+    
+    CHECK_CUDA_ERROR(cudaMemcpy(matrix, d_matrix, N * N * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERROR(cudaFree(d_matrix));
+    CHECK_CUDA_ERROR(cudaEventDestroy(start));
+    CHECK_CUDA_ERROR(cudaEventDestroy(stop));
+}
+
+// 验证结果
+bool verifyResult(float* cpuResult, float* gpuResult, int N, float epsilon = 1e-4) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            if (abs(cpuResult[i * N + j] - gpuResult[i * N + j]) > epsilon) {
+                cout << "Mismatch at (" << i << "," << j << "): CPU=" << cpuResult[i * N + j] 
+                     << ", GPU=" << gpuResult[i * N + j] << endl;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// 测试不同配置的性能
+void test(int N, int blockSize, int kernelVersion) {
+    cout << "\nTesting N=" << N << ", blockSize=" << blockSize << ", kernelVersion=" << kernelVersion << endl;
+    
+    // 分配内存并初始化矩阵
+    float* matrix = new float[N * N];
+    float* cpuMatrix = new float[N * N];
+    initialize(matrix, N);
+    memcpy(cpuMatrix, matrix, N * N * sizeof(float));
+    
+    // 测试CPU性能
+    auto cpuStart = chrono::high_resolution_clock::now();
+    cpuGaussian(cpuMatrix, N);
+    auto cpuEnd = chrono::high_resolution_clock::now();
+    auto cpuDuration = chrono::duration_cast<chrono::milliseconds>(cpuEnd - cpuStart).count();
+    cout << "CPU time: " << cpuDuration << " ms" << endl;
+    
+    // 测试GPU性能
+    gpuGaussian(matrix, N, blockSize, kernelVersion);
+    
+    // 验证结果
+    if (verifyResult(cpuMatrix, matrix, N)) {
+        cout << "Results match!" << endl;
+    } else {
+        cout << "Results do not match!" << endl;
+    }
+    
+    delete[] matrix;
+    delete[] cpuMatrix;
+}
+
+int main() {
+    // 测试不同矩阵大小和线程块配置
+    vector<int> matrixSizes = {256, 512, 1024, 2048};
+    vector<int> blockSizes = {16, 32, 64, 128, 256, 512};
+    
+    for (int size : matrixSizes) {
+        for (int bs : blockSizes) {
+            if (bs > size) continue;  // 块大小不能超过矩阵大小
+            
+            // 测试三种不同的核函数实现
+            for (int version = 1; version <= 3; version++) {
+                test(size, bs, version);
+            }
+        }
+    }
+    
+    return 0;
+}
